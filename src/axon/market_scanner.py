@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from html import unescape
 import json
@@ -19,6 +19,24 @@ REMOTIVE_INFO_URL = "https://remotive.com/remote-jobs/api"
 _CACHE_SECONDS = 6 * 60 * 60
 _REQUEST_TIMEOUT_SECONDS = 10
 _MAX_RESULTS = 20
+
+# Intentionally small, explicit vocabulary. Skills are detected only in the
+# provider's title, description, and tags fields; category/company are excluded.
+SKILL_ALIASES: dict[str, tuple[str, ...]] = {
+    "AWS": ("aws", "amazon web services"),
+    "C#": ("c#", "c sharp"),
+    "C++": ("c++", "c plus plus"),
+    "Docker": ("docker",),
+    "Java": ("java",),
+    "JavaScript": ("javascript", "java script"),
+    "Kubernetes": ("kubernetes", "k8s"),
+    "Node.js": ("node.js", "nodejs", "node js"),
+    "PostgreSQL": ("postgresql", "postgres"),
+    "Python": ("python",),
+    "React": ("react", "react.js", "reactjs"),
+    "SQL": ("sql",),
+    "TypeScript": ("typescript", "type script"),
+}
 
 
 class MarketDataError(RuntimeError):
@@ -40,6 +58,101 @@ class MarketJob:
 
     def to_dict(self) -> dict[str, str | None]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class EnrichedMarketJob:
+    """A listing plus conservative, source-grounded enrichment metadata."""
+
+    job: MarketJob
+    skills: tuple[str, ...]
+    publication_date_quality: str
+    duplicate_of: str | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self.job.to_dict(),
+            "skills": list(self.skills),
+            "publication_date_quality": self.publication_date_quality,
+            "duplicate_of": self.duplicate_of,
+        }
+
+
+def extract_skills(raw: Any) -> tuple[str, ...]:
+    """Find recognized skills in Remotive title, description, and tags only."""
+    if not isinstance(raw, dict):
+        return ()
+
+    parts = [raw.get("title"), raw.get("description")]
+    tags = raw.get("tags")
+    if isinstance(tags, list):
+        parts.extend(tags)
+    text = unescape(re.sub(r"<[^>]*>", " ", " ".join(
+        part for part in parts if isinstance(part, str)
+    ))).casefold()
+
+    found = []
+    for skill, aliases in SKILL_ALIASES.items():
+        for alias in aliases:
+            pattern = rf"(?<!\w){re.escape(alias.casefold())}(?!\w)"
+            if re.search(pattern, text):
+                found.append(skill)
+                break
+    return tuple(found)
+
+
+def _date_quality(value: Any) -> str:
+    """Describe the precision supplied by Remotive without inventing dates."""
+    published = _optional_text(value)
+    if published is None:
+        return "missing"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", published):
+        try:
+            datetime.fromisoformat(published)
+        except ValueError:
+            return "invalid"
+        return "date_only"
+    try:
+        parsed = datetime.fromisoformat(published.replace("Z", "+00:00"))
+    except ValueError:
+        return "invalid"
+    return "timezone_present" if parsed.tzinfo is not None else "timezone_unspecified"
+
+
+def enrich_jobs(raw_jobs: list[dict[str, Any]], jobs: list[MarketJob]) -> list[EnrichedMarketJob]:
+    """Enrich returned listings; duplicates require the same Remotive URL."""
+    seen_urls: dict[str, str] = {}
+    enriched = []
+    for raw, job in zip(raw_jobs, jobs, strict=True):
+        parsed = urlsplit(job.url)
+        canonical_url = f"{parsed.netloc.casefold()}{parsed.path.rstrip('/')}"
+        duplicate_of = seen_urls.get(canonical_url)
+        seen_urls.setdefault(canonical_url, job.url)
+        date_quality = _date_quality(raw.get("publication_date"))
+        if date_quality == "date_only":
+            job = replace(job, publication_date=_optional_text(raw.get("publication_date")))
+        enriched.append(
+            EnrichedMarketJob(
+                job=job,
+                skills=extract_skills(raw),
+                publication_date_quality=date_quality,
+                duplicate_of=duplicate_of,
+            )
+        )
+    return enriched
+
+
+def skill_frequency(jobs: list[EnrichedMarketJob]) -> dict[str, Any]:
+    """Count listings containing each recognized skill in this returned sample."""
+    counts: dict[str, int] = {}
+    for enriched in jobs:
+        for skill in enriched.skills:
+            counts[skill] = counts.get(skill, 0) + 1
+    return {
+        "basis": "sample_based_returned_listings",
+        "sample_size": len(jobs),
+        "job_counts": dict(sorted(counts.items())),
+    }
 
 
 def _optional_text(value: Any) -> str | None:
@@ -141,6 +254,16 @@ class RemotiveScanner:
 
     def search(self, keyword: str, limit: int = 5) -> list[MarketJob]:
         """Return the newest matching jobs, with a small caller-controlled cap."""
+        return [job for _, job in self._search_matches(keyword, limit)]
+
+    def search_enriched(self, keyword: str, limit: int = 5) -> list[EnrichedMarketJob]:
+        """Search and enrich only the source records returned to the caller."""
+        matches = self._search_matches(keyword, limit)
+        return enrich_jobs(
+            [raw for raw, _ in matches], [job for _, job in matches]
+        )
+
+    def _search_matches(self, keyword: str, limit: int) -> list[tuple[dict[str, Any], MarketJob]]:
         keyword = keyword.strip()
         if not keyword:
             raise ValueError("keyword must not be blank")
@@ -148,13 +271,13 @@ class RemotiveScanner:
             raise ValueError(f"limit must be between 1 and {_MAX_RESULTS}")
 
         needle = keyword.casefold()
-        matches: list[MarketJob] = []
+        matches: list[tuple[dict[str, Any], MarketJob]] = []
         for raw in self._load_jobs():
             if needle not in _searchable_text(raw):
                 continue
             job = normalize_job(raw)
             if job is not None:
-                matches.append(job)
+                matches.append((raw, job))
                 if len(matches) == limit:
                     break
         return matches

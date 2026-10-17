@@ -1,12 +1,15 @@
 
 """Minimal FastAPI application entry point."""
 
+from dataclasses import asdict
 from io import BytesIO
 from typing import Annotated
 
 import pdfplumber
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from pydantic import BaseModel, Field
 
+from axon.automation_risk import analyze_automation_risk
 from axon.config import Settings
 from axon.market_scanner import (
     MarketDataError,
@@ -14,9 +17,21 @@ from axon.market_scanner import (
     REMOTIVE_INFO_URL,
 )
 from axon.resume import extract_education, extract_projects, extract_skills
+from axon.semantic_gap import analyze_explicit_skill_gap
 
 scanner = RemotiveScanner()
 MAX_RESUME_SIZE = 5 * 1024 * 1024  # 5 MB
+
+
+class SkillGapRequest(BaseModel):
+    known_skills: list[str] = Field(default_factory=list)
+    required_skills: list[str] = Field(default_factory=list)
+    optional_skills: list[str] = Field(default_factory=list)
+
+
+class AutomationRiskRequest(BaseModel):
+    title: str | None = None
+    tasks: list[dict[str, object]] = Field(default_factory=list)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -55,6 +70,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "count": len(jobs),
             "jobs": [job.to_dict() for job in jobs],
         }
+
+    @app.post("/analysis/skill-gap", tags=["analysis"])
+    def skill_gap(request: SkillGapRequest) -> dict[str, object]:
+        """Compare explicit resume skill names with explicit job skill names."""
+        result = analyze_explicit_skill_gap(
+            request.known_skills,
+            request.required_skills,
+            request.optional_skills,
+        )
+        return asdict(result)
+
+    @app.post("/analysis/automation-risk", tags=["analysis"])
+    def automation_risk(request: AutomationRiskRequest) -> dict[str, object]:
+        """Assess supplied task flags with the documented qualitative heuristic."""
+        return asdict(analyze_automation_risk(request.model_dump()))
 
     @app.post("/profile/resume", tags=["profile"])
     async def upload_resume(

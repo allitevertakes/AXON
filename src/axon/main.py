@@ -21,6 +21,7 @@ from axon.market_scanner import (
     MarketDataError,
     RemotiveScanner,
     REMOTIVE_INFO_URL,
+    skill_frequency,
 )
 from axon.resume import extract_education, extract_projects, extract_skills
 from axon.semantic_gap import analyze_explicit_skill_gap
@@ -77,6 +78,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "jobs": [job.to_dict() for job in jobs],
         }
 
+    @app.get("/market/insights", tags=["market"])
+    def market_insights(
+        keyword: Annotated[str, Query(min_length=2, max_length=100)],
+        limit: Annotated[int, Query(ge=1, le=20)] = 5,
+    ) -> dict[str, object]:
+        """Return skill-frequency signals for the current job sample."""
+        try:
+            jobs = scanner.search_enriched(keyword, limit=limit)
+        except MarketDataError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="The job-data provider is temporarily unavailable.",
+            ) from exc
+
+        return {
+            "keyword": keyword.strip(),
+            "source": "Remotive",
+            "source_info_url": REMOTIVE_INFO_URL,
+            "count": len(jobs),
+            "jobs": [job.to_dict() for job in jobs],
+            "skill_frequency": skill_frequency(jobs),
+        }
+
     @app.post("/analysis/skill-gap", tags=["analysis"])
     def skill_gap(request: SkillGapRequest) -> dict[str, object]:
         """Compare explicit candidate skills with job requirements."""
@@ -103,7 +127,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/profile/resume", tags=["profile"])
     async def upload_resume(
-        file: Annotated[UploadFile, File(description="PDF resume, maximum 5 MB")],
+        file: Annotated[
+            UploadFile, File(description="PDF resume, maximum 5 MB")
+        ],
     ) -> dict[str, object]:
         """Extract resume details and persist the resulting profile."""
         try:

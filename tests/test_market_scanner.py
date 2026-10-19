@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 import axon.market_scanner as market_scanner
 from axon.config import Settings
 from axon.main import create_app
-from axon.market_scanner import MarketDataError, RemotiveScanner
+from axon.market_scanner import MarketDataError, RemotiveScanner, extract_skills
 
 
 class FakeResponse:
@@ -63,6 +63,81 @@ def test_search_filters_and_normalizes_provider_fields(monkeypatch) -> None:
     assert jobs[0].publication_date == "2026-10-01T09:30:00"
     assert jobs[0].url.startswith("https://remotive.com/")
     assert jobs[0].source == "Remotive"
+
+
+def test_skill_extraction_uses_only_available_text_and_known_variants() -> None:
+    raw = sample_job(
+        title="JavaScript and AWS Engineer",
+        description="<p>Uses Postgres, PostgreSQL, NodeJS, and pythonic patterns.</p>",
+        tags=["K8s", "React.js", "SQL"],
+        category="Docker",
+        company_name="Kubernetes Inc.",
+    )
+
+    assert extract_skills(raw) == (
+        "AWS",
+        "JavaScript",
+        "Kubernetes",
+        "Node.js",
+        "PostgreSQL",
+        "React",
+        "SQL",
+    )
+    assert extract_skills(
+        {"title": "Engineer", "category": "Python", "company_name": "Java"}
+    ) == ()
+    assert extract_skills({"title": "Pythonic engineer"}) == ()
+
+
+@pytest.mark.parametrize(
+    ("publication_date", "expected"),
+    [
+        ("2026-10-01T09:30:00Z", "timezone_present"),
+        ("2026-10-01T09:30:00", "timezone_unspecified"),
+        ("2026-10-01", "date_only"),
+        (None, "missing"),
+        ("soon", "invalid"),
+    ],
+)
+def test_enrichment_reports_date_precision_honestly(
+    monkeypatch, publication_date, expected
+) -> None:
+    mock_feed(monkeypatch, [sample_job(publication_date=publication_date)])
+
+    result = RemotiveScanner().search_enriched("python")[0]
+
+    assert result.publication_date_quality == expected
+    if expected == "date_only":
+        assert result.job.publication_date == "2026-10-01"
+    if expected in {"missing", "invalid"}:
+        assert result.job.publication_date is None
+
+
+def test_enrichment_flags_only_same_listing_url_and_counts_sample_skills(
+    monkeypatch,
+) -> None:
+    duplicate_url = "https://remotive.com/remote-jobs/python/one"
+    mock_feed(
+        monkeypatch,
+        [
+            sample_job(url=duplicate_url, tags=["Python"]),
+            sample_job(url=f"{duplicate_url}?utm_source=test", tags=["AWS"]),
+            sample_job(
+                title="Python Support Engineer",
+                url="https://remotive.com/remote-jobs/python/two",
+                tags=["Python", "Python"],
+            ),
+        ],
+    )
+
+    results = RemotiveScanner().search_enriched("python", limit=3)
+
+    assert len(results) == 3
+    assert results[0].duplicate_of is None
+    assert results[1].duplicate_of == results[0].job.url
+    assert results[2].duplicate_of is None
+    assert results[0].skills.count("Python") == 1
+    assert results[2].job.title == "Python Support Engineer"
 
 
 def test_missing_optional_fields_are_normalized_to_none(monkeypatch) -> None:
@@ -151,19 +226,63 @@ def test_results_are_capped_and_feed_is_cached(monkeypatch) -> None:
 
 
 def test_market_endpoint_returns_attribution_and_small_result_set(monkeypatch) -> None:
-    mock_feed(monkeypatch, [sample_job()])
+    mock_feed(
+        monkeypatch,
+        [
+            sample_job(),
+            sample_job(
+                title="Python Support Engineer",
+                category=None,
+                candidate_required_location="",
+                salary=None,
+            ),
+        ],
+    )
     import axon.main as api_main
 
     monkeypatch.setattr(api_main, "scanner", RemotiveScanner())
     client = TestClient(create_app(Settings(environment="test")))
 
-    response = client.get("/market/jobs", params={"keyword": "python"})
+    response = client.get(
+        "/market/jobs", params={"keyword": "  Python  ", "limit": 2}
+    )
 
     assert response.status_code == 200
     payload = response.json()
+    assert set(payload) == {
+        "keyword",
+        "source",
+        "source_info_url",
+        "count",
+        "jobs",
+    }
+    assert payload["keyword"] == "Python"
     assert payload["source"] == "Remotive"
-    assert payload["count"] == 1
-    assert payload["jobs"][0]["url"].startswith("https://remotive.com/")
+    assert payload["source_info_url"] == "https://remotive.com/remote-jobs/api"
+    assert payload["count"] == len(payload["jobs"]) == 2
+    assert set(payload["jobs"][0]) == {
+        "title",
+        "company",
+        "category",
+        "eligible_location",
+        "salary",
+        "publication_date",
+        "url",
+        "source",
+    }
+    assert payload["jobs"][0] == {
+        "title": "Python Platform Engineer",
+        "company": "Example Co",
+        "category": "Software Development",
+        "eligible_location": "Worldwide",
+        "salary": "$100,000 - $120,000",
+        "publication_date": "2026-10-01T09:30:00",
+        "url": "https://remotive.com/remote-jobs/software-dev/python-engineer-123",
+        "source": "Remotive",
+    }
+    assert payload["jobs"][1]["category"] is None
+    assert payload["jobs"][1]["eligible_location"] is None
+    assert payload["jobs"][1]["salary"] is None
 
 
 def test_market_endpoint_maps_provider_errors_to_502(monkeypatch) -> None:
@@ -180,3 +299,38 @@ def test_market_endpoint_maps_provider_errors_to_502(monkeypatch) -> None:
 
     assert response.status_code == 502
     assert response.json()["detail"] == "The job-data provider is temporarily unavailable."
+
+
+def test_market_insights_endpoint_labels_sample_statistics(monkeypatch) -> None:
+    mock_feed(
+        monkeypatch,
+        [
+            sample_job(tags=["Python", "AWS"]),
+            sample_job(
+                title="Python Support Engineer",
+                url="https://remotive.com/remote-jobs/python/support-456",
+                tags=["Python", "Python"],
+            ),
+        ],
+    )
+    import axon.main as api_main
+
+    monkeypatch.setattr(api_main, "scanner", RemotiveScanner())
+    client = TestClient(create_app(Settings(environment="test")))
+
+    response = client.get(
+        "/market/insights", params={"keyword": "python", "limit": 2}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["source"] == "Remotive"
+    assert payload["count"] == 2
+    assert payload["skill_frequency"] == {
+        "basis": "sample_based_returned_listings",
+        "sample_size": 2,
+        "job_counts": {"AWS": 1, "Python": 2},
+    }
+    assert payload["jobs"][0]["skills"] == ["AWS", "Python"]
+    assert payload["jobs"][0]["publication_date_quality"] == "timezone_unspecified"
+    assert payload["jobs"][0]["duplicate_of"] is None

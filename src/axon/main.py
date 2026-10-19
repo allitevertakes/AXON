@@ -9,8 +9,14 @@ import pdfplumber
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
+from app.db import (
+    get_resume_profile,
+    list_resume_profiles,
+    save_resume_profile,
+)
 from axon.automation_risk import analyze_automation_risk
 from axon.config import Settings
+from axon.learning_path import build_learning_path
 from axon.market_scanner import (
     MarketDataError,
     RemotiveScanner,
@@ -73,7 +79,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/analysis/skill-gap", tags=["analysis"])
     def skill_gap(request: SkillGapRequest) -> dict[str, object]:
-        """Compare explicit resume skill names with explicit job skill names."""
+        """Compare explicit candidate skills with job requirements."""
         result = analyze_explicit_skill_gap(
             request.known_skills,
             request.required_skills,
@@ -81,16 +87,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return asdict(result)
 
+    @app.post("/analysis/learning-path", tags=["analysis"])
+    def learning_path(request: SkillGapRequest) -> dict[str, object]:
+        """Recommend learning actions for missing job skills."""
+        return build_learning_path(
+            known_skills=request.known_skills,
+            required_skills=request.required_skills,
+            optional_skills=request.optional_skills,
+        )
+
     @app.post("/analysis/automation-risk", tags=["analysis"])
     def automation_risk(request: AutomationRiskRequest) -> dict[str, object]:
-        """Assess supplied task flags with the documented qualitative heuristic."""
+        """Assess supplied task flags with a qualitative heuristic."""
         return asdict(analyze_automation_risk(request.model_dump()))
 
     @app.post("/profile/resume", tags=["profile"])
     async def upload_resume(
         file: Annotated[UploadFile, File(description="PDF resume, maximum 5 MB")],
     ) -> dict[str, object]:
-        """Extract text and identify skills mentioned in a PDF resume."""
+        """Extract resume details and persist the resulting profile."""
         try:
             if not file.filename or not file.filename.lower().endswith(".pdf"):
                 raise HTTPException(
@@ -136,15 +151,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             education = extract_education(text)
             projects = extract_projects(text)
 
+            profile_id = save_resume_profile(
+                filename=file.filename,
+                skills=skills,
+                education=education,
+                projects=projects,
+            )
+
             return {
+                "profile_id": profile_id,
                 "filename": file.filename,
                 "extraction_method": "pdf_text_extraction",
                 "skills_detected": len(skills),
                 "skills": skills,
-		"education_count": len(education),
-		"education": education,
-        "project_count": len(projects),
-        "projects": projects,
+                "education_count": len(education),
+                "education": education,
+                "project_count": len(projects),
+                "projects": projects,
                 "notice": (
                     "Skills are keyword matches from resume text, "
                     "not verified qualifications."
@@ -152,6 +175,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         finally:
             await file.close()
+
+    @app.get("/profile/saved", tags=["profile"])
+    def saved_profiles(
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    ) -> dict[str, object]:
+        """List saved resume profiles without returning their extracted content."""
+        return {"profiles": list_resume_profiles(limit=limit)}
+
+    @app.get("/profile/saved/{profile_id}", tags=["profile"])
+    def saved_profile(profile_id: int) -> dict[str, object]:
+        """Retrieve one saved resume profile."""
+        result = get_resume_profile(profile_id)
+        if result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Saved resume profile not found.",
+            )
+        return result
 
     return app
 
